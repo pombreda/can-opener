@@ -39,7 +39,7 @@ information** about this access to SimpleDB. This information can be
 later used to automatically remove accesses that were created "too
 long" ago::
 
-    $ can-opener --manage
+    $ can-opener --manage --tags ''
     REMOVE: can-opener-sg: 85.156.38.7/32 -> tcp:22-22 (TooOld)
     REMOVE: can-opener-sg: 77.86.202.212/32 -> tcp:8080-8080 (TooOld)
     REMOVE: can-opener-sg: 85.156.38.7/32 -> tcp:8080-8080 (TooOld)
@@ -64,6 +64,14 @@ longer need them, you can just use --remove to make them go away::
    $ can-opener --remove
    REMOVE: can-opener-sg: 88.115.164.95/32 -> tcp:22-22
    REMOVE: can-opener-sg: 88.115.164.95/32 -> tcp:8080-8080
+
+Unless you have changed the default tags, you could also do this to
+zap **all** holes that have been created by you (but only by you)::
+
+   $ can-opener --remove -p all all
+
+The ``all`` values refer to *all ports* (``-p all``) and *all
+addresses* (``all`` -- equivalent to ``0.0.0.0/0``).
 
 How to set up
 -------------
@@ -147,7 +155,7 @@ but this is not recommended.
 Also include **at least one other security group** that is not managed
 by can opener. You should use this security group for static firewall
 rules. Do not use can opener's security group for other purposes.
-(Non-can opener rules will get zapped with ``--manage``!)
+(Non-can opener rules will get zapped with ``--manage --tags ''``!)
 
 Let's take a Jenkins CI instance with repository stored in GitHub as
 an example:
@@ -165,6 +173,6 @@ an example:
   50.57.128.197``
 * Configure GitHub post-receive hook to publish to the Jenkins' URL,
   like ``http://**your.instance.dns**:8080/jenkins/github-webhook/``.
-* Set up can opener to periodically run as ``can-opener --manage``
-  (cron or Jenkins periodic job are both valid options). Tune
-  ``--lifetime`` to suit your needs (default is 8 hours).
+* Set up can opener to periodically run as ``can-opener --manage
+  --tags ''`` (cron or Jenkins periodic job are both valid options).
+  Tune ``--lifetime`` to suit your needs (default is 8 hours).

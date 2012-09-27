@@ -38,23 +38,42 @@ import time
 import hashlib
 import logging
 import boto.s3.connection
+from netaddr import IPNetwork, IPSet
 
 version = (1,1,0)
+
+class StatefulSecurityGrant(object):
+    def __init__(self, cidr, proto, from_port, to_port, first_added=None, last_added=None, is_active=True, tags=[]):
+        self.cidr = cidr
+        self.proto = proto
+        self.from_port = from_port
+        self.to_port = to_port
+        self.first_added = first_added
+        self.last_added = last_added
+        self.is_active = is_active
+        self.tags = tags
 
 class StatefulSecurityGroup(object):
     def __init__(self, sg, sdb):
         self.sg = sg
         self.sdb = sdb
-        self.log = logging.getLogger(__name__)
+        self.log = logging.getLogger('can-opener')
 
     @property
     def name(self):
         return self.sg.name
 
     def __grant_key(self, cidr, proto, from_port, to_port):
-        return hashlib.sha1("%s,%s,%s,%s,%s" % (str(self.sg.name), str(cidr), str(proto), str(from_port), str(to_port))).hexdigest()
+        return hashlib.sha1("%s,%s,%s,%s,%s" % (str(self.sg.name), str(cidr),
+                                                str(proto), str(from_port),
+                                                str(to_port))).hexdigest()
 
     def __get_grant(self, cidr, proto, from_port, to_port):
+        """Return grant from SDB, or a freshly generated.
+
+For a freshly generated item, this will only initialize the fields
+that are part of search key, other SDB item fields are not
+initialized."""
         key = self.__grant_key(cidr, proto, from_port, to_port)
         item = self.sdb.get_item(key)
         if not item:
@@ -74,26 +93,49 @@ class StatefulSecurityGroup(object):
             self.log.debug("Deleting key %r", key)
             item.delete()
 
-    def add_grant(self, cidr, proto, from_port, to_port):
-        self.log.info("Adding grant %s -> %s:%d-%d", cidr, proto, from_port, to_port)
+    def add_grant(self, cidr, proto, from_port, to_port, tags):
+        self.log.info("Adding grant %s -> %s:%d-%d", cidr, proto, from_port,
+                      to_port)
         self.sg.authorize(proto, str(from_port), str(to_port), cidr)
         item = self.__get_grant(cidr, proto, from_port, to_port)
         item.add_value('added', int(time.time()))
+        item.add_value('tags', ",".join(tags))
         item.save()
 
+    def _is_sg_rule_match(self, rule, cidr, proto, from_port, to_port):
+        """Return true is given SG rule matches cidr, proto, from_port and to_port."""
+        rule_set = IPSet([ grant.cidr_ip for grant in rule.grants ])
+        match_set = IPSet([ cidr ])
+        overlap_set = rule_set & match_set
+
+        self.log.debug("rule_set=%r match_set=%r overlap_set=%r", rule_set, match_set, overlap_set)
+
+        if not overlap_set:
+            self.log.debug("no overlap between %r and %r", rule_set, match_set)
+            return False
+
+        # Cidr already checked at this point.
+        result = (rule.ip_protocol == proto
+                  and int(rule.from_port) >= from_port
+                  and int(rule.to_port) <= to_port)
+
+        self.log.debug("proto %r / %r, from_port %r / %r, to_port %r / %r ==> %r",
+                       rule.ip_protocol, proto,
+                       rule.from_port, from_port,
+                       rule.to_port, to_port, result)
+
+        return result
+
     def has_grant(self, cidr, proto, from_port, to_port):
-        # go through all rules and their individual grants
+        """Look for *exact* match for cidr, proto, from_port and to_port"""
+
         for rule in self.sg.rules:
             self.log.debug("has_grant: (%r,%r,%r,%r) <=> (%r,%r,%r,%r)",
                            cidr, proto, from_port, to_port,
                            [ grant.cidr_ip for grant in rule.grants ],
                            rule.ip_protocol, rule.from_port, rule.to_port)
 
-            if (rule.ip_protocol == proto
-                and int(rule.from_port) == from_port
-                and int(rule.to_port) == to_port
-                and cidr in [ grant.cidr_ip for grant in rule.grants ]):
-
+            if self._is_sg_rule_match(rule, cidr, proto, from_port, to_port):
                 self.log.debug("has_grant: matched")
                 return True
 
@@ -101,20 +143,118 @@ class StatefulSecurityGroup(object):
         return False
 
     def update_grant(self, cidr, proto, from_port, to_port):
-        self.log.info("Updating grant %s -> %s:%d-%d", cidr, proto, from_port, to_port)
+        self.log.info("Updating grant %s -> %s:%d-%d", cidr, proto, from_port,
+                      to_port)
         item = self.__get_grant(cidr, proto, from_port, to_port)
         item.add_value('added', int(time.time()))
         item.save()
 
     def del_grant(self, cidr, proto, from_port, to_port):
-        #print "del_grant: cidr=%r, proto=%r, from_port=%r, to_port=%r" % (cidr, proto, from_port, to_port)
-        self.log.info("Deleting grant %s -> %s:%d-%d", cidr, proto, from_port, to_port)
+        self.log.info("Deleting grant %s -> %s:%d-%d", cidr, proto, from_port,
+                      to_port)
         self.sg.revoke(proto, str(from_port), str(to_port), cidr)
         self.__del_grant(cidr, proto, from_port, to_port)
 
-    def get_grants(self):
+    def get_grants(self, cidr, proto, from_port, to_port):
+        """Returns a list of grants that match the given cidr, proto,
+        from_port and to_port values."""
+        sg_grants = self._grants_from_sg_rules(filter(lambda r: self._is_sg_rule_match(r, cidr, proto, from_port, to_port), self.sg.rules))
+        self.log.debug("sg grants: %r", sg_grants)
+        # include only those sdb rules which map to a key in sg_rules
+        sdb_grants = dict((k, v) for k, v in self._grants_from_sdb_items(self._get_sdb_items()).items() if k in sg_grants)
+        self.log.debug("sdb grants: %r", sdb_grants)
+        # and merge those
+        grants = self._merge_grants(sg_grants, sdb_grants)
+        return grants.values()
+
+    def _grants_from_sg_rules(self, sg_rules):
+        grants = {}
+
+        for rule in sg_rules:
+            self.log.debug("Sg %s rule: %r", self.sg.name, rule)
+
+            for cidr in [ grant.cidr_ip for grant in rule.grants ]:
+                self.log.debug("** rule %r cidr %r", rule, cidr)
+                key = self.__grant_key(cidr, rule.ip_protocol, rule.from_port,
+                                       rule.to_port)
+                grants[key] = StatefulSecurityGrant(cidr, rule.ip_protocol,
+                                                    int(rule.from_port),
+                                                    int(rule.to_port),
+                                                    is_active=True)
+
+        return grants
+
+    def _grants_from_sdb_items(self, items):
+        grants = {}
+
+        for item in items:
+            self.log.debug("Sdb %s sg %s item: %r", self.sdb.name,
+                           self.sg.name, item)
+            (cidr, proto, from_port, to_port) = (item['cidr'], item['proto'],
+                                                 int(item['from_port']),
+                                                 int(item['to_port']))
+
+            tags = filter(len, item.get('tags', "").split(","))
+
+            # If there are any invalid entries, remove them
+            # indiscriminantly. At least if we can.
+            if self.__grant_key(cidr, proto, from_port, to_port) != item.name:
+                self.sdb.remove_item(item.name)
+                print "%r did not match generated grant key, removed" % (
+                    item.name)
+                continue
+
+            def added_as_list():
+                if type(item['added']) == list:
+                    return item['added']
+                return [item['added']]
+
+            first_added = min([ int(added) for added in added_as_list() ])
+            last_added = max([ int(added) for added in added_as_list() ])
+            key = item.name
+
+            # grants[key] = [ cidr, proto, from_port, to_port, first_added,
+            #                 last_added, False, tags ]
+
+            grants[key] = StatefulSecurityGrant(cidr, proto, from_port, to_port,
+                                                first_added, last_added,
+                                                is_active=False, tags=tags)
+
+        return grants
+
+    def _get_sdb_items(self):
+        return self.sdb.select('select * from `%s` where `sg` = "%s"' % (self.sdb.name,
+                                                                           self.sg.name))
+
+    def _merge_grants(self, sg_grants, sdb_grants):
+        assert sg_grants is not None and sdb_grants is not None
+        grants = {}
+        for key in set(sg_grants.keys()) | set(sdb_grants.keys()):
+            if key in sg_grants and key in sdb_grants:
+                self.log.debug("%s in both SG and SDB records", key)
+                sg_rule = sg_grants[key]
+                sdb_rule = sdb_grants[key]
+
+                #grants[key] = list(sg_rule)
+                #grants[key][4:6] = sdb_rule[4:6]
+                #grants[key][7] = sdb_rule[7]
+                grants[key] = StatefulSecurityGrant(sg_rule.cidr, sg_rule.proto, sg_rule.from_port, sg_rule.to_port,
+                                                    first_added=sdb_rule.first_added,
+                                                    last_added=sdb_rule.last_added,
+                                                    is_active=True,
+                                                    tags=sdb_rule.tags)
+            else:
+                self.log.debug("%s only in %s records", key, "SG" if key in sg_grants else "SDB")
+                grants[key] = sg_grants.get(key, sdb_grants.get(key, None))
+
+            assert key in grants
+
+        return grants
+
+
+    def get_all_grants(self):
         # return list of
-        # (cidr,low,high,proto,lowest_added,highest_added,is_active)
+        # (cidr,low,high,proto,first_added,last_added,is_active,tags)
         # values, note that *_added can be None if this grant doesn't
         # have a matching simpledb record
 
@@ -131,46 +271,17 @@ class StatefulSecurityGroup(object):
         # 3) If not in SG, but in SDB, *_added are computed but
         #    is_active is False.
 
-        rules = {}
-
-        for rule in self.sg.rules:
-            self.log.debug("Sg %s rule: %r", self.sg.name, rule)
-
-            for cidr in [ grant.cidr_ip for grant in rule.grants ]:
-                key = self.__grant_key(cidr, rule.ip_protocol, rule.from_port, rule.to_port)
-                rules[key] = [cidr, rule.ip_protocol, int(rule.from_port), int(rule.to_port), None, None, True]
+        sg_grants = self._grants_from_sg_rules(self.sg.rules)
 
         # print "rules now: %r" % (rules,)
 
-        for item in self.sdb.select('select * from `%s` where `sg` = "%s"' % (self.sdb.name, self.sg.name)):
-            self.log.debug("Sdb %s sg %s item: %r", self.sdb.name, self.sg.name, item)
-            (cidr, proto, from_port, to_port) = (item['cidr'], item['proto'], int(item['from_port']), int(item['to_port']))
+        sdb_grants = self._grants_from_sdb_items(self._get_sdb_items())
 
-            # If there are any invalid entries, remove them
-            # indiscriminantly. At least if we can.
-            if self.__grant_key(cidr, proto, from_port, to_port) != item.name:
-                self.sdb.remove_item(item.name)
-                print "%r did not match generated grant key, removed" % (item.name)
-                continue
+        # merge the two sets
+        grants = self._merge_grants(sg_grants, sdb_grants)
 
-            def added_as_list():
-                if type(item['added']) == list:
-                    return item['added']
-                return [item['added']]
-
-            lowest_added = min([ int(added) for added in added_as_list() ])
-            highest_added = max([ int(added) for added in added_as_list() ])
-            key = item.name
-
-            if key in rules:
-                self.log.debug("Matching firewall rule found")
-                rules[key][4:6] = [lowest_added, highest_added]
-            else:
-                self.log.debug("No matching firewall rule found")
-                rules[key] = [ cidr, proto, from_port, to_port, lowest_added, highest_added, False]
-
-        self.log.debug("Final rules: %r", rules.values())
-        return rules.values()
+        self.log.debug("Final grants: %r", grants.values())
+        return grants.values()
 
 STRICT = 1
 NORMAL = 2
@@ -183,6 +294,7 @@ Valid OPTIONS are:
 
   -V, --version
   -h, --help
+  -n, --dry-run
 
   -A, --access-key ACCESS-KEY
   -S, --secret-key SECRET-KEY
@@ -197,6 +309,7 @@ Valid OPTIONS are:
   -l, --lifetime SECS
 
   -p, --ports [tcp:|udp:]PORT[-PORT]|all|*
+  -t, --tags TAG[,TAG ...]
 
 IP can be simple ip address or CIDR block. If no IP address
 is given and one is needed, then current Internet-visible
@@ -205,13 +318,29 @@ external IP address is fetched using http://api.externalip.net/ip/.
 ACCESS-KEY, SECRET-KEY and REGION can be all specified via
 environmental variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 and AWS_REGION respectively.
+
+Tags can be used for fine-grained control of access control
+management. The default value for tags is your current username. You
+can clear the tag list by giving an empty tag or "all" (--tag '' or
+--tag all).
+
+If any tags are defined, the behavior of some actions are changed:
+
+* add: Given tag list is added to the created grant, *if* one is
+  created (if a grant exists already, its tag list is not changed).
+
+* remove: Only grants that contain any of the given tags are removed.
+
+* manage: Only grants that contain any of the given tags are managed.
+
 """ % (sys.argv[0])
 
 def main():
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hVA:S:R:s:a:l:m:d:p:nd:",
+        opts, args = getopt.getopt(sys.argv[1:], "hVdA:S:R:s:a:l:m:d:p:nd:t:",
                                    ["help",
                                     "version",
+                                    "debug",
                                     "access-key=",
                                     "secret-key=",
                                     "region=",
@@ -229,7 +358,8 @@ def main():
                                     "manage",
                                     "initialize",
                                     "initialize-destructive",
-                                    "log="
+                                    "log=",
+                                    "tags=",
                                     ])
     except getopt.GetoptError, err:
         print str(err)
@@ -238,7 +368,8 @@ def main():
 
     access_key = None # boto defaults to AWS_ACCESS_KEY_ID in env
     secret_key = None # boto defaults to AWS_SECRET_ACCESS_KEY in env
-    region = os.getenv("AWS_REGION", "us-east-1") # this would be nice addition to boto
+    region = os.getenv("AWS_REGION", "us-east-1") # this would be nice
+                                                  # addition to boto
     security_groups = "can-opener-sg"
     domain_name = "can-opener-sdb"
     ips = []
@@ -248,6 +379,7 @@ def main():
     lifetime = 8 * 60 * 60
     dry_run = False
     log_level = logging.WARNING
+    tags = filter(len, [ os.getenv('LOGNAME', os.getenv('USER', "")) ])
 
     # TODO: Fetch all of this information, e.g. ports, addesses
     # etc. from config file, hopefully also allowing different ports
@@ -263,6 +395,8 @@ def main():
         elif o in ('-V', '--version'):
             print "can-opener %s" % (".".join(map(str, version)),)
             sys.exit(0)
+        elif o in ('-d', '--debug'):
+            logging.getLogger('can-opener').setLevel('DEBUG')
         elif o in ("-A", "--access-key"):
             access_key = a
         elif o in ("-S", "--secret-key"):
@@ -297,10 +431,16 @@ def main():
             log_level = getattr(logging, a.upper())
         elif o in ('-d', '--domain'):
             domain_name = a
+        elif o in ('-t', '--tags'):
+            if a and a != 'all' and a != '*':
+                tags.append(filter(len, a.split(",")))
+            else:
+                tags = []
         else:
             assert False, "unhandled option"
 
     logging.basicConfig(level=log_level)
+    log = logging.getLogger('can-opener')
 
     def get_ips():
         if len(args) == 0:
@@ -310,7 +450,14 @@ def main():
         else:
             ips = args
 
-        ips = map(lambda ip: '%s/32' % ip if not '/' in ip else ip, ips)
+        def parse_ip(ip):
+            if ip == 'all' or ip == '*':
+                return "0/0"
+            elif not '/' in ip:
+                return ip + "/32"
+            return ip
+
+        ips = map(parse_ip, ips)
         get_ips = lambda: ips
         return ips
 
@@ -341,7 +488,8 @@ def main():
     def get_sg_names():
         return security_groups.split(',')
 
-    def check_remove_grant(mode, ports, lifetime, cidr, proto, from_port, to_port, first_added, last_added, is_active):
+    def check_remove_grant(mode, ports, lifetime, cidr, proto, from_port,
+                           to_port, first_added, last_added, is_active):
         if not is_active:
             # Under no circumstance we want to keep non-active
             # (e.g. things only in simpledb without real match in
@@ -357,25 +505,27 @@ def main():
             return "TooOld"
         elif mode == STRICT:
             # In strict mode we require that grants honor the
-            # given port ranges *exactly*.
+            # given port ranges.
             good_grant = False
             for (p, low, high) in ports:
-                if p == proto and from_port == low and to_port == high:
+                if p == proto and from_port >= low and to_port <= high:
                     good_grant = True
                     break
-
             if not good_grant:
                 return "BadRange"
 
         return None
 
-    conn = boto.ec2.connect_to_region(region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
-    sdb = boto.sdb.connect_to_region(region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    conn = boto.ec2.connect_to_region(region, aws_access_key_id=access_key,
+                                      aws_secret_access_key=secret_key)
+    sdb = boto.sdb.connect_to_region(region, aws_access_key_id=access_key,
+                                     aws_secret_access_key=secret_key)
 
     for sg_name in get_sg_names():
         if action == 'initialize' or action == 'initialize-destructive':
             destructive = action == 'initialize-destructive'
-            iam = IAMConnection(aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+            iam = IAMConnection(aws_access_key_id=access_key,
+                                aws_secret_access_key=secret_key)
 
             owner_id = None
 
@@ -424,20 +574,25 @@ def main():
 
             # 1) Check if IAM group 'can-opener-grp' exists, if not,
             # create and set policy rules.
-            group_exists = group_name in [g.group_name for g in iam.get_all_groups().list_groups_response.list_groups_result.groups]
+            group_exists = group_name in [g.group_name for g in (iam.get_all_groups().list_groups_response.list_groups_result.groups)]
             if group_exists and destructive:
                 print "DESTROY: Destroying old group %s" % (group_name,)
-                for user in iam.get_group(group_name).get_group_response.get_group_result.users:
-                    print "DESTROY: Removing user %s from group %s" % (user.user_name, group_name)
+                for user in (iam.get_group(group_name)
+                             .get_group_response.get_group_result.users):
+                    print "DESTROY: Removing user %s from group %s" % (
+                        user.user_name, group_name)
                     iam.remove_user_from_group(group_name, user.user_name)
                 for policy in iam.get_all_group_policies(group_name).list_group_policies_response.list_group_policies_result.policy_names:
-                    print "DESTROY: Removing policy %s from group %s" % (policy, group_name)
+                    print "DESTROY: Removing policy %s from group %s" % (
+                        policy, group_name)
                     iam.delete_group_policy(group_name, policy)
                 iam.delete_group(group_name)
             if not group_exists or destructive:
-                print "INITIALIZE: Group %s does not exist, creating" % (group_name,)
+                print "INITIALIZE: Group %s does not exist, creating" % (
+                    group_name,)
                 group = iam.create_group(group_name)
-                print "INITIALIZE: Adding policy %s to group %s" % (policy_name, group_name)
+                print "INITIALIZE: Adding policy %s to group %s" % (
+                    policy_name, group_name)
                 iam.put_group_policy(group_name, policy_name, policy_json)
 
             # 2) Check if IAM user 'can-opener-user' exists, if not,
@@ -446,16 +601,20 @@ def main():
             user_exists = user_name in [u.user_name for u in iam.get_all_users().list_users_response.list_users_result.users]
             if user_exists and destructive:
                 for key in iam.get_all_access_keys(user_name).list_access_keys_response.list_access_keys_result.access_key_metadata:
-                    print "DESTROY: Destroying access key %s of user %s" % (key.access_key_id, user_name)
+                    print "DESTROY: Destroying access key %s of user %s" % (
+                        key.access_key_id, user_name)
                     iam.delete_access_key(key.access_key_id, user_name)
                 print "DESTROY: Destructing old user %s" % (user_name,)
                 iam.delete_user(user_name)
             if not user_exists or destructive:
-                print "INIITALIZE: User %s does not exist, creating" % (user_name,)
+                print "INIITALIZE: User %s does not exist, creating" % (
+                    user_name,)
                 user = iam.create_user(user_name)
-                print "INITIALIZE: Adding user %s to group %s" % (user_name, group_name)
+                print "INITIALIZE: Adding user %s to group %s" % (
+                    user_name, group_name)
                 iam.add_user_to_group(group_name, user_name)
-                print "INITIALIZE: Creating new access key for user %s" % (user_name,)
+                print "INITIALIZE: Creating new access key for user %s" % (
+                    user_name,)
                 key = iam.create_access_key(user_name).create_access_key_response.create_access_key_result.access_key
                 access_key = key.access_key_id
                 secret_key = key.secret_access_key
@@ -468,7 +627,8 @@ IMPORTANT! The secret key cannot be recovered later - make a note of it NOW!
     Access Key:     %(accesskey)s
     Secret Key:     %(secretkey)s
 
-    Export:         export AWS_ACCESS_KEY_ID=%(accesskey)s AWS_SECRET_ACCESS_KEY=%(secretkey)s
+    Export:         export AWS_ACCESS_KEY_ID=%(accesskey)s \
+AWS_SECRET_ACCESS_KEY=%(secretkey)s
 ****************************************************************************
 """ % {
                     'userid': user_name,
@@ -478,18 +638,22 @@ IMPORTANT! The secret key cannot be recovered later - make a note of it NOW!
             # 3) Check if SimpleDB domain exist, if not, create.
             try:
                 domain = sdb.get_domain(domain_name, True)
-                print "INITIALIZE: Domain %s already exists, not touching it" % (domain_name,)
+                print "INITIALIZE: Domain %s already exists, " \
+                    "not touching it" % (domain_name,)
             except SDBResponseError, err:
                 if err.error_code != 'NoSuchDomain':
                     raise err
-                print "INITIALIZE: Domain %s does not exist, creating it" % (domain_name,)
+                print "INITIALIZE: Domain %s does not exist, creating it" % (
+                    domain_name,)
                 domain = sdb.create_domain(domain_name)
 
             # 4) Check if security group exist, if not, create.
             if sg_exists:
-                print "INITIALIZE: Security group %s already exists, not touching it" % (sg_name,)
+                print "INITIALIZE: Security group %s already exists, " \
+                    "not touching it" % (sg_name,)
             else:
-                print "INITIALIZE: Security group %s does not exist, creating it" % (sg_name,)
+                print "INITIALIZE: Security group %s does not exist, " \
+                    "creating it" % (sg_name,)
                 conn.create_security_group(sg_name, 'Created by Can Opener')
 
             # Done! Skip to next.
@@ -512,45 +676,69 @@ IMPORTANT! The secret key cannot be recovered later - make a note of it NOW!
             for ip in ips:
                 for (proto, low, high) in valid_ports:
                     if s.has_grant(ip, proto, low, high):
-                        print "UPDATE: %s: %s -> %s:%d-%d" % (s.name, ip, proto, low, high)
+                        print "UPDATE: %s: %s -> %s:%d-%d" % (s.name, ip,
+                                                              proto, low, high)
                         if not dry_run:
                             s.update_grant(ip, proto, low, high)
                     else:
-                        print "ADD: %s: %s -> %s:%d-%d" % (s.name, ip, proto, low, high)
+                        print "ADD: %s: %s -> %s:%d-%d (%s)" % (s.name, ip,
+                                                                proto, low, high,
+                                                                ",".join(tags))
                         if not dry_run:
-                            s.add_grant(ip, proto, low, high)
+                            s.add_grant(ip, proto, low, high, tags)
         elif action == 'remove':
             ips = get_ips()
             valid_ports = get_ports()
+            tags_set = set(tags)
 
             for ip in ips:
                 for (proto, low, high) in valid_ports:
-                    if s.has_grant(ip, proto, low, high):
-                        print "REMOVE: %s: %s -> %s:%d-%d" % (s.name, ip, proto, low, high)
+                    for g in s.get_grants(ip, proto, low, high):
+                        if tags_set and not tags_set & set(g.tags):
+                            log.debug("skipping grant %r from management, no tag match for %r", g, tags_set)
+                            continue
+
+                        print "REMOVE: %s: %s -> %s:%d-%d" % (s.name, g.cidr, g.proto, g.from_port, g.to_port)
+
                         if not dry_run:
-                            s.del_grant(ip, proto, low, high)
+                            s.del_grant(g.cidr, g.proto, g.from_port, g.to_port)
+
         elif action == 'list':
             print "%s %s" % (sg_name, '-' * (76 - len(sg_name)))
-            print "%-20s %-15s %-30s %-8s" % ("CIDR", "Proto & Ports", "Time range", "Active")
+            print "%-20s %-15s %-30s %-8s %s" % ("CIDR", "Proto & Ports",
+                                              "Time range", "Active", "Tags")
 
-            for (cidr, proto, from_port, to_port, first_added, last_added, is_active) in s.get_grants():
-                proto_and_ports = "%s:%d-%d" % (proto, from_port, to_port)
-                if first_added is None or last_added is None:
+            for g in s.get_all_grants():
+                proto_and_ports = "%s:%d-%d" % (g.proto, g.from_port, g.to_port)
+                if g.first_added is None or g.last_added is None:
                     added = "---"
                 else:
-                    added = "%d-%d" % (first_added, last_added)
+                    added = "%d-%d" % (g.first_added, g.last_added)
 
-                print "%-20s %-15s %-30s %-8s" % (cidr, proto_and_ports, added, is_active)
+                print "%-20s %-15s %-30s %-8s %s" % (g.cidr, proto_and_ports,
+                                                     added, g.is_active,
+                                                     ",".join(g.tags))
+
         elif action == 'manage':
             valid_ports = get_ports()
-            for (cidr, proto, from_port, to_port, first_added, last_added, is_active) in s.get_grants():
+            tags_set = set(tags)
+
+            for g in s.get_all_grants():
+                if tags_set and not tags_set & set(g.tags):
+                    log.debug("skipping grant %r from management, no tag match for %r", g, tags_set)
+                    continue
+
                 reason = check_remove_grant(mode, valid_ports, lifetime,
-                                            cidr,
-                                            proto, from_port, to_port,
-                                            first_added, last_added,
-                                            is_active)
+                                            g.cidr,
+                                            g.proto, g.from_port, g.to_port,
+                                            g.first_added, g.last_added,
+                                            g.is_active)
                 if reason:
-                    print "REMOVE: %s: %s -> %s:%d-%d (%s)" % (s.name, cidr, proto, from_port, to_port, reason)
+                    print "REMOVE: %s: %s -> %s:%d-%d (%s)" % (s.name, g.cidr,
+                                                               g.proto,
+                                                               g.from_port,
+                                                               g.to_port,
+                                                               reason)
                     if not dry_run:
                         s.del_grant(cidr, proto, from_port, to_port)
         else:
