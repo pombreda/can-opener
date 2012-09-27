@@ -39,6 +39,8 @@ import hashlib
 import logging
 import boto.s3.connection
 
+version = (1,1,0)
+
 class StatefulSecurityGroup(object):
     def __init__(self, sg, sdb):
         self.sg = sg
@@ -179,6 +181,9 @@ def usage():
 
 Valid OPTIONS are:
 
+  -V, --version
+  -h, --help
+
   -A, --access-key ACCESS-KEY
   -S, --secret-key SECRET-KEY
   -R, --region REGION
@@ -204,10 +209,28 @@ and AWS_REGION respectively.
 
 def main():
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "hA:S:R:s:a:l:m:d:p:nd:",
-                                   ["help", "access-key=", "secret-key=", "region=", "security-groups=", "domain=", "ports=",
-                                    "domain=", "action=", "mode=", "lifetime=", "dry-run",
-                                    "add", "remove", "list", "manage", "initialize", "initialize-destructive", "log="])
+        opts, args = getopt.getopt(sys.argv[1:], "hVA:S:R:s:a:l:m:d:p:nd:",
+                                   ["help",
+                                    "version",
+                                    "access-key=",
+                                    "secret-key=",
+                                    "region=",
+                                    "security-groups=",
+                                    "domain=",
+                                    "ports=",
+                                    "domain=",
+                                    "action=",
+                                    "mode=",
+                                    "lifetime=",
+                                    "dry-run",
+                                    "add",
+                                    "remove",
+                                    "list",
+                                    "manage",
+                                    "initialize",
+                                    "initialize-destructive",
+                                    "log="
+                                    ])
     except getopt.GetoptError, err:
         print str(err)
         usage()
@@ -236,6 +259,9 @@ def main():
     for o, a in opts:
         if o in ("-h", "--help"):
             usage()
+            sys.exit(0)
+        elif o in ('-V', '--version'):
+            print "can-opener %s" % (".".join(map(str, version)),)
             sys.exit(0)
         elif o in ("-A", "--access-key"):
             access_key = a
