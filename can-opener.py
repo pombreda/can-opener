@@ -40,7 +40,7 @@ import logging
 import boto.s3.connection
 from netaddr import IPNetwork, IPSet
 
-version = (1,1,0)
+version = (1,1,1)
 
 class StatefulSecurityGrant(object):
     def __init__(self, cidr, proto, from_port, to_port, first_added=None, last_added=None, is_active=True, tags=[]):
@@ -734,13 +734,14 @@ AWS_SECRET_ACCESS_KEY=%(secretkey)s
                                             g.first_added, g.last_added,
                                             g.is_active)
                 if reason:
-                    print "REMOVE: %s: %s -> %s:%d-%d (%s)" % (s.name, g.cidr,
-                                                               g.proto,
-                                                               g.from_port,
-                                                               g.to_port,
-                                                               reason)
+                    print "REMOVE: %s: %s -> %s:%d-%d (%s): %s" % (s.name, g.cidr,
+                                                                   g.proto,
+                                                                   g.from_port,
+                                                                   g.to_port,
+                                                                   ",".join(g.tags),
+                                                                   reason)
                     if not dry_run:
-                        s.del_grant(cidr, proto, from_port, to_port)
+                        s.del_grant(g.cidr, g.proto, g.from_port, g.to_port)
         else:
             print "ERROR: Unrecognized action '%s'" % (action,)
             sys.exit(2)
