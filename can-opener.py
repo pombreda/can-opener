@@ -465,7 +465,7 @@ def main():
     log = logging.getLogger('can-opener')
 
     # useful only for remove and manage -- add would be too dangerous
-    if default_all and action in ('remove', 'manage')
+    if default_all and action in ('remove', 'manage'):
         tags = tags if tags is not None else []
         ports = ports if ports is not None else 'all'
         args = args if len(args) else ['0/0']
