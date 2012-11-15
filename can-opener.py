@@ -373,6 +373,7 @@ def main():
                                     "initialize-destructive",
                                     "log=",
                                     "tags=",
+                                    "all",
                                     ])
     except getopt.GetoptError, err:
         print str(err)
@@ -386,13 +387,17 @@ def main():
     security_groups = "can-opener-sg"
     domain_name = "can-opener-sdb"
     ips = []
-    ports = '22,8080'
+    ports = None
     action = 'add'
     mode = STRICT
     lifetime = 8 * 60 * 60
     dry_run = False
     log_level = logging.WARNING
-    tags = filter(len, [ os.getenv('LOGNAME', os.getenv('USER', "")) ])
+    tags = None
+
+    default_tags = filter(len, [ os.getenv('LOGNAME', os.getenv('USER', "")) ])
+    default_all = False
+    default_ports = '22,8080'
 
     # TODO: Fetch all of this information, e.g. ports, addesses
     # etc. from config file, hopefully also allowing different ports
@@ -408,6 +413,8 @@ def main():
         elif o in ('-V', '--version'):
             print "can-opener %s" % (".".join(map(str, version)),)
             sys.exit(0)
+        elif o in ('--all',):
+            default_all = True
         elif o in ('-d', '--debug'):
             logging.getLogger('can-opener').setLevel('DEBUG')
         elif o in ("-A", "--access-key"):
@@ -446,6 +453,8 @@ def main():
             domain_name = a
         elif o in ('-t', '--tags'):
             if a and a != 'all' and a != '*':
+                if not tags:
+                    tags = []
                 tags.append(filter(len, a.split(",")))
             else:
                 tags = []
@@ -454,6 +463,15 @@ def main():
 
     logging.basicConfig(level=log_level)
     log = logging.getLogger('can-opener')
+
+    # useful only for remove and manage -- add would be too dangerous
+    if default_all and action in ('remove', 'manage')
+        tags = tags if tags is not None else []
+        ports = ports if ports is not None else 'all'
+        args = args if len(args) else ['0/0']
+
+    tags = tags if tags is not None else default_tags
+    ports = ports if ports is not None else default_ports
 
     def get_ips():
         if len(args) == 0:
